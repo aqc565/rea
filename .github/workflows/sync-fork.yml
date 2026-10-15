@@ -18,4 +18,6 @@ jobs:
           base: main            # 上游仓库的默认分支（若为 master 就改成 master）
           head: main            # 你 fork 里的分支（通常同名）
           merge_method: merge   # 合并方式：merge / rebase / squash
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # 必须用带 workflow 权限的 PAT：同步会改动 .github/workflows/，
+          # GITHUB_TOKEN 天生不能改工作流文件，存在仓库 secret 里
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
