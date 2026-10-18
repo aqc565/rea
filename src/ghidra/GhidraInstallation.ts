@@ -7,19 +7,16 @@ import {
   type GhidraJavaProbeFailure,
   type GhidraJavaProbeOptions,
 } from "./GhidraJavaProbe.js";
-import type { Result } from "../domain/result.js";
+import { ok, type Result } from "../domain/result.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { readGhidraExecutableHeader } from "./GhidraExecutableHeader.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
-import { constants } from "node:fs";
 import {
-  accessSync,
-  closeSync,
-  fstatSync,
-  openSync,
-  readFileSync,
-  readSync,
-  realpathSync,
-  statSync,
-} from "node:fs";
+  readGhidraInstallationProperties,
+  type GhidraInstallationFileOptions,
+} from "./GhidraInstallationProperties.js";
+import { constants } from "node:fs";
+import { accessSync, realpathSync, statSync } from "node:fs";
 import { delimiter as pathDelimiter, dirname, posix, win32 } from "node:path";
 
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
@@ -80,9 +77,6 @@ const NATIVE_ARCHITECTURES: readonly {
   { node: "arm", binary: "arm" },
   { node: "arm64", binary: "arm64" },
 ];
-
-/** Bound installation discovery reads; larger headers remain unknown. */
-const EXECUTABLE_HEADER_PROBE_BYTES = 4096;
 
 /** Compatibility of one present native decompiler with the inspected host. */
 type NativeDecompilerCompatibility =
@@ -207,6 +201,7 @@ interface GhidraInstallationObservation {
   /** Parsed release identity, never inferred from the installation directory name. */
   readonly configurationDirectoryName: string | null;
   readonly nativeDecompilerPath: string | null;
+  readonly nativeDecompilerHeaderFailure?: AnalysisError;
   readonly javaCommand: string;
   readonly javaProbeFailure?: GhidraJavaProbeFailure;
   /** Observed java.vm.name; omitted when the probe cannot establish VM identity. */
@@ -267,15 +262,24 @@ export interface GhidraExecutableHeaderProbe {
 export interface GhidraInstallationHost {
   readonly platform?: NodeJS.Platform;
   readonly architecture?: NodeJS.Architecture;
-  readText(path: string): string | undefined;
+  readText(
+    path: string,
+    options: GhidraInstallationFileOptions,
+  ): string | undefined | Promise<string | undefined>;
   executable(path: string): boolean;
   /**
    * Read a bounded header prefix of one executable so admission can reject a
    * tool built for another platform or architecture. An omitted seam, or an
    * unreadable file, reports the header as unknown and never rejects an
-   * installation that the other checks already accept.
+   * installation that the other checks already accept. Cancellation and
+   * incomplete descriptor cleanup propagate as failures.
    */
-  executableHeader?(path: string): GhidraExecutableHeaderProbe | undefined;
+  executableHeader?(
+    path: string,
+    options: GhidraInstallationFileOptions,
+  ):
+    | Result<GhidraExecutableHeaderProbe | undefined, AnalysisError>
+    | Promise<Result<GhidraExecutableHeaderProbe | undefined, AnalysisError>>;
   probeJava(
     command: string,
     environment: NodeJS.ProcessEnv,
@@ -297,6 +301,10 @@ interface GhidraInstallationCoordinates {
   readonly applicationPropertiesPath: string | null;
   readonly analyzeHeadlessPath: string | null;
   readonly nativeDecompilerPath: string | null;
+  readonly nativeDecompilerHeader: Result<
+    GhidraExecutableHeaderProbe | undefined,
+    AnalysisError
+  >;
   readonly properties: GhidraApplicationProperties | undefined;
   readonly javaCommand: string;
   readonly java: GhidraJavaObservation | undefined;
@@ -348,6 +356,12 @@ export const inspectGhidraInstallation = async (
     configurationDirectoryName:
       coordinates.properties?.configurationDirectoryName ?? null,
     nativeDecompilerPath: coordinates.nativeDecompilerPath,
+    ...(coordinates.nativeDecompilerHeader.ok
+      ? {}
+      : {
+          nativeDecompilerHeaderFailure:
+            coordinates.nativeDecompilerHeader.error,
+        }),
     javaCommand: coordinates.javaCommand,
     ...(coordinates.javaProbeFailure === undefined
       ? {}
@@ -467,7 +481,23 @@ const installationCoordinates = async (
   const properties =
     applicationPropertiesPath === null
       ? undefined
-      : host.readText(applicationPropertiesPath);
+      : await host.readText(applicationPropertiesPath, {
+          resourceOwner: options.resourceOwner,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
+  const nativeDecompilerHeader =
+    nativeDecompilerPath === null || host.executableHeader === undefined
+      ? ok(undefined)
+      : await host.executableHeader(nativeDecompilerPath, {
+          resourceOwner: options.resourceOwner,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
+  if (
+    !nativeDecompilerHeader.ok &&
+    (nativeDecompilerHeader.error instanceof AnalysisCancelledError ||
+      nativeDecompilerHeader.error.cleanupIncomplete)
+  )
+    throw nativeDecompilerHeader.error;
   const javaCommand = (() => {
     if (options.javaHome !== undefined)
       return path.join(
@@ -527,6 +557,7 @@ const installationCoordinates = async (
     applicationPropertiesPath,
     analyzeHeadlessPath,
     nativeDecompilerPath,
+    nativeDecompilerHeader,
     properties:
       properties === undefined
         ? undefined
@@ -586,7 +617,7 @@ const installationChecks = ({
     remediation:
       "Restore support/analyzeHeadless or support/analyzeHeadless.bat from the official Ghidra release.",
   }),
-  nativeDecompilerCheck({ coordinates, platform, architecture, host }),
+  nativeDecompilerCheck({ coordinates, platform, architecture }),
   javaCheck(
     coordinates.java,
     coordinates.javaCommand,
@@ -638,6 +669,13 @@ export const ghidraInstallationDiagnostics = (
   install_dir: inspection.installDir,
   analyze_headless_path: inspection.analyzeHeadlessPath,
   native_decompiler_path: inspection.nativeDecompilerPath,
+  ...(inspection.nativeDecompilerHeaderFailure === undefined
+    ? {}
+    : {
+        native_decompiler_header_failure: projectAnalysisError(
+          inspection.nativeDecompilerHeaderFailure,
+        ),
+      }),
   application_properties_path: inspection.applicationPropertiesPath,
   provider_version: inspection.providerVersion,
   java_command: inspection.javaCommand,
@@ -731,21 +769,25 @@ const nativeDecompilerCheck = ({
   coordinates,
   platform,
   architecture,
-  host,
 }: Pick<
   GhidraInstallationCheckContext,
-  "coordinates" | "platform" | "architecture" | "host"
+  "coordinates" | "platform" | "architecture"
 >): GhidraInstallationCheck => {
   const path = coordinates.nativeDecompilerPath;
   const compatibility =
     path === null
       ? undefined
-      : assessNativeDecompiler(
-          path,
-          platform,
-          architecture,
-          host.executableHeader?.(path),
-        );
+      : !coordinates.nativeDecompilerHeader.ok
+        ? {
+            status: "unknown" as const,
+            detail: `${path} header is unknown: ${coordinates.nativeDecompilerHeader.error.message}`,
+          }
+        : assessNativeDecompiler(
+            path,
+            platform,
+            architecture,
+            coordinates.nativeDecompilerHeader.value,
+          );
   // Ghidra resolves its native decompiler directory from the JVM's os.arch,
   // not the host process architecture. A JDK running under emulation (for
   // example x86_64 under Rosetta on Apple silicon) selects a directory that
@@ -942,37 +984,8 @@ const javaRemediation = (
 };
 
 export const systemGhidraInstallationHost = (): GhidraInstallationHost => ({
-  readText(path) {
-    try {
-      // Ghidra loads this file with Properties.load(InputStream), which maps
-      // bytes as ISO-8859-1 rather than decoding UTF-8.
-      return readFileSync(path).toString("latin1");
-    } catch (cause: unknown) {
-      // best-effort cleanup: optional install probing; unreadable means unknown.
-      void cause;
-      return undefined;
-    }
-  },
-  executableHeader(path) {
-    let handle: number | undefined;
-    try {
-      handle = openSync(
-        path,
-        constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOCTTY,
-      );
-      const metadata = fstatSync(handle);
-      if (!metadata.isFile()) return undefined;
-      const bytes = Buffer.alloc(EXECUTABLE_HEADER_PROBE_BYTES);
-      const read = readSync(handle, bytes, 0, bytes.length, 0);
-      return { bytes: bytes.subarray(0, read), size: metadata.size };
-    } catch (cause: unknown) {
-      // best-effort cleanup: a header that cannot be read stays unknown.
-      void cause;
-      return undefined;
-    } finally {
-      if (handle !== undefined) closeSync(handle);
-    }
-  },
+  readText: readGhidraInstallationProperties,
+  executableHeader: readGhidraExecutableHeader,
   executable(path) {
     try {
       accessSync(path, constants.X_OK);
