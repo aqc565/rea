@@ -3,10 +3,14 @@ import { expect, it } from "vitest";
 
 import { finishAnalysisCommand } from "../../../src/cli/finishAnalysisCommand.js";
 import { AnalysisOutputError } from "../../../src/domain/analysisErrorCore.js";
-import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import {
+  projectAnalysisError,
+  projectAnalysisErrorWithoutCapturedOutput,
+} from "../../../src/domain/analysisErrorProjection.js";
 import { ProviderCleanupError } from "../../../src/domain/providerCleanupError.js";
 import { err, ok } from "../../../src/domain/result.js";
 import { scriptCaptureEvidenceFixture } from "../../fixtures/webScriptCapture.js";
+import { releaseOwnedCleanup } from "../../support/cleanupRelease.js";
 
 it("preserves producer-owned cleanup failure when service close does not resolve it", async () => {
   const evidence = scriptCaptureEvidenceFixture();
@@ -53,29 +57,55 @@ it("returns completed partial Evidence when cancellation arrives during close", 
   });
 });
 
-it("preserves the primary operation error when cancellation arrives during close", async () => {
-  const controller = new AbortController();
-  const result = await finishAnalysisCommand(
-    async () =>
-      err(new AnalysisOutputError("inspect_web_page", "primary failure")),
-    {
-      close: async () => {
-        controller.abort();
+it.each([
+  ["final", false],
+  ["final", true],
+  ["initial", false],
+  ["initial", true],
+] as const)(
+  "preserves the primary failure and late cancellation with %s projection (close fails=%s)",
+  async (failureProjection, closeFails) => {
+    const controller = new AbortController();
+    const reason = { during: "final close" };
+    const failure = new AnalysisOutputError(
+      "inspect_web_page",
+      "primary failure",
+    );
+    const result = await finishAnalysisCommand(
+      async () => err(failure),
+      {
+        close: async () => {
+          controller.abort(reason);
+          if (closeFails)
+            throw new ProviderCleanupError(
+              "fixture-provider",
+              ["retained connection"],
+              { reason: "close failed" },
+            );
+        },
       },
-    },
-    "fixture-provider",
-    "inspect_web_page",
-    controller.signal,
-  ).then(projectCliAnalysisResult);
+      "fixture-provider",
+      "inspect_web_page",
+      controller.signal,
+      undefined,
+      { failureProjection },
+    );
 
-  expect(result).toMatchObject({
-    code: "unreadable_output",
-    details: {
-      reason: "primary failure",
-      operation: "inspect_web_page",
-    },
-  });
-});
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: closeFails ? "cleanup_incomplete" : "unreadable_output",
+        details: {
+          reason: "primary failure",
+          operation: "inspect_web_page",
+          secondary_failures: [{ code: "cancelled" }],
+        },
+      },
+    });
+    expect(failure.secondaryFailures).toHaveLength(1);
+    expect(failure.secondaryFailures[0]?.cause).toBe(reason);
+  },
+);
 
 it("retains late cancellation and completed Evidence when close also fails", async () => {
   const evidence = scriptCaptureEvidenceFixture();
@@ -110,6 +140,67 @@ it("retains late cancellation and completed Evidence when close also fails", asy
   });
 });
 
+it("keeps the initial failure snapshot when close resolves its cleanup but fails another resource during cancellation", async () => {
+  const controller = new AbortController();
+  const primary = new ProviderCleanupError(
+    "fixture-provider",
+    ["initial resource"],
+    { reason: "initial cleanup refused" },
+    {
+      operation: "capture_browser_scenario",
+      completedObservation: scriptCaptureEvidenceFixture(),
+      capturedOutput: {
+        stdout: "startup output",
+        stderr: "startup diagnostic",
+        exit_code: 1,
+        signal: null,
+        truncated: false,
+      },
+    },
+  );
+  const initial = projectAnalysisErrorWithoutCapturedOutput(primary);
+  const result = await finishAnalysisCommand(
+    async () => err(primary),
+    {
+      close: async () => {
+        releaseOwnedCleanup(primary);
+        controller.abort("cancelled during cleanup retry");
+        throw new ProviderCleanupError(
+          "fixture-provider",
+          ["remaining resource"],
+          { reason: "remaining cleanup denied" },
+        );
+      },
+    },
+    "fixture-provider",
+    "capture_browser_scenario",
+    controller.signal,
+    undefined,
+    {
+      failureProjection: "initial",
+      recoverCompletedObservation: () => {
+        throw new Error("Initial failure snapshots must not recover output");
+      },
+    },
+  );
+  expect(result).toMatchObject({
+    ok: false,
+    error: {
+      code: "cleanup_incomplete",
+      details: {
+        captured_output: { stdout: "startup output" },
+        diagnostics: {
+          primary_error: initial,
+          cleanup_error: { details: { resources: ["remaining resource"] } },
+        },
+      },
+    },
+  });
+  expect(result).not.toHaveProperty(
+    "error.details.diagnostics.primary_error.details.captured_output",
+  );
+});
+
 it.each([false, true])(
   "recovers only producer-attested completed output after confirmed cleanup (cancel=%s)",
   async (cancel) => {
@@ -129,7 +220,7 @@ it.each([false, true])(
       async () => err(failure),
       {
         close: async () => {
-          failure.resolveCleanup();
+          releaseOwnedCleanup(failure);
           if (cancel) controller.abort("cancelled during successful retry");
         },
       },
@@ -176,7 +267,7 @@ it.each(["unresolved", "ordinary-partial", "initial-projection"] as const)(
       async () => err(failure),
       {
         close: async () => {
-          if (kind !== "unresolved") failure.resolveCleanup();
+          if (kind !== "unresolved") releaseOwnedCleanup(failure);
         },
       },
       "fixture-provider",

@@ -156,6 +156,7 @@ export const addJavaScriptArtifactFiles = (
       file,
       analyzed.javascript,
       jsonValue,
+      packagesByPath.get(file.path),
       isSkippedJavaScriptAnalysis(analyzed),
     );
     if (
@@ -632,6 +633,7 @@ const createFileTarget = (
   file: JavaScriptArtifactFile,
   javascript: JavaScriptArtifactAnalysis["files"][number]["javascript"],
   json: JavaScriptArtifactAnalysis["json_modules"][number] | undefined,
+  packageValue: JavaScriptArtifactAnalysis["packages"][number] | undefined,
   skipped: boolean,
 ): ApplicationNode => {
   const kind = artifactFileNodeKind(file.kind);
@@ -655,7 +657,7 @@ const createFileTarget = (
           text_status: file.text.included ? "included" : file.text.reason,
           parse_status:
             javascript?.parse_status ?? (skipped ? "skipped" : null),
-          ...(javascript?.analysis_coverage !== undefined
+          ...(javascript !== null
             ? { analysis_coverage: javascript.analysis_coverage }
             : javascript === null && file.kind === "javascript"
               ? {
@@ -671,6 +673,9 @@ const createFileTarget = (
                 }
               : {}),
           json_parse_status: json?.status ?? null,
+          ...(file.kind === "package-json"
+            ? { package_parse_status: packageValue?.status ?? null }
+            : {}),
           json_top_level_keys: json?.top_level_keys ?? [],
           omitted_json_top_level_keys:
             json === undefined
@@ -685,6 +690,10 @@ const createFileTarget = (
           path: file.path,
           operation: "inventory-relevant-file",
           coverage: completeApplicationCoverage(),
+          limitations:
+            javascript?.loaderCondition === undefined
+              ? []
+              : [javascript.loaderCondition],
         }),
       },
     ],
