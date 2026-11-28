@@ -16,6 +16,24 @@ export const BUN_FIXTURE_TRAILER = Buffer.from("\n---- Bun! ----\n");
 export const BUN_FIXTURE_GRAPH_SUFFIX_BYTES =
   OFFSETS_BYTES + BUN_FIXTURE_TRAILER.length;
 
+/** Observe actual read bytes without taking ownership of the file handle. */
+export const observeBunFixtureReads = (
+  handle: FileHandle,
+  onRead: (bytesRead: number) => void,
+): FileHandle => {
+  const read = handle.read.bind(handle);
+  return new Proxy(handle, {
+    get: (target, key) =>
+      key === "read"
+        ? async (...args: Parameters<typeof read>) => {
+            const result = await read(...args);
+            onRead(result.bytesRead);
+            return result;
+          }
+        : Reflect.get(target, key),
+  });
+};
+
 /** Exercise the same two-stage probe and payload read as the artifact reader. */
 export const locateBunGraphFixture = async (
   handle: FileHandle,
@@ -217,11 +235,12 @@ export const elfBunSection = (section: Buffer, nameOffset = 11): Buffer => {
   bytes.writeUInt16LE(1, 62);
   shstr.copy(bytes, shstrOffset);
   section.copy(bytes, sectionOffset);
-  writeElfSection(bytes, tableOffset + 64, 1, shstrOffset, shstr.length);
+  writeElfSection(bytes, tableOffset + 64, 1, 3, shstrOffset, shstr.length);
   writeElfSection(
     bytes,
     tableOffset + 128,
     nameOffset,
+    1,
     sectionOffset,
     section.length,
   );
@@ -232,10 +251,12 @@ const writeElfSection = (
   bytes: Buffer,
   header: number,
   name: number,
+  type: number,
   offset: number,
   size: number,
 ): void => {
   bytes.writeUInt32LE(name, header);
+  bytes.writeUInt32LE(type, header + 4);
   bytes.writeBigUInt64LE(BigInt(offset), header + 24);
   bytes.writeBigUInt64LE(BigInt(size), header + 32);
 };
